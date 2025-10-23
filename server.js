@@ -3,17 +3,37 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
-const { spawn } = require('child_process');
+const puppeteer = require('puppeteer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const M3U_URL = 'https://cwdiptvb.github.io/tv_channels.m3u';
 const SCAN_INTERVAL = 5 * 60 * 1000; // 5 minutes
-const STREAM_TIMEOUT = 10000; // 10 seconds per stream test
+const STREAM_TIMEOUT = 12000; // 12 seconds per stream test
 const STREAMS_FILE = path.join(__dirname, 'streams.json');
 
 // Store current working streams
 let workingStreams = {};
+let browser = null;
+
+// Initialize browser
+async function initBrowser() {
+  if (!browser) {
+    console.log('Launching headless browser...');
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process'
+      ]
+    });
+    console.log('Browser launched');
+  }
+  return browser;
+}
 
 // Initialize streams file
 async function initStreamsFile() {
@@ -46,7 +66,6 @@ async function parseM3U() {
       const line = lines[i].trim();
 
       if (line.startsWith('#EXTINF:')) {
-        // Extract tvg-id
         const tvgIdMatch = line.match(/tvg-id="([^"]+)"/);
         const tvgNameMatch = line.match(/tvg-name="([^"]+)"/);
         
@@ -69,74 +88,102 @@ async function parseM3U() {
   }
 }
 
-// Test stream by attempting to fetch and parse the m3u8 manifest
+// Test stream using video.js in headless browser
 async function testStreamURL(url) {
+  const browser = await initBrowser();
+  let page = null;
+  
   try {
-    // First, try to fetch the manifest
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), STREAM_TIMEOUT);
-
-    const response = await axios.get(url, {
-      signal: controller.signal,
-      timeout: STREAM_TIMEOUT,
-      validateStatus: (status) => status === 200,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    page = await browser.newPage();
+    
+    // Set user agent to simulate real browser
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Create HTML page with video.js
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/video.js/7.20.3/video-js.min.css" rel="stylesheet">
+  <style>body { margin: 0; background: #000; }</style>
+</head>
+<body>
+  <video id="player" class="video-js" controls autoplay muted></video>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/video.js/7.20.3/video.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/videojs-contrib-hls/5.15.0/videojs-contrib-hls.min.js"></script>
+  <script>
+    window.testResult = { status: 'testing', error: null };
+    
+    const player = videojs('player', {
+      autoplay: true,
+      muted: true,
+      html5: {
+        vhs: {
+          overrideNative: true
+        },
+        nativeAudioTracks: false,
+        nativeVideoTracks: false
       }
     });
-
-    clearTimeout(timeoutId);
-
-    // Check if response looks like a valid m3u8 file
-    const content = response.data;
-    if (typeof content === 'string' && 
-        (content.includes('#EXTM3U') || content.includes('#EXT-X-STREAM-INF') || content.includes('.ts'))) {
-      
-      // Additional validation: try to fetch the first segment URL if it's a master playlist
-      if (content.includes('#EXT-X-STREAM-INF')) {
-        // It's a master playlist, extract the first variant
-        const lines = content.split('\n');
-        for (let line of lines) {
-          line = line.trim();
-          if (line && !line.startsWith('#')) {
-            // Found a variant playlist URL
-            let variantUrl = line;
-            if (!variantUrl.startsWith('http')) {
-              // Relative URL, construct absolute
-              const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
-              variantUrl = baseUrl + variantUrl;
-            }
-            
-            // Try to fetch the variant playlist
-            try {
-              const variantResponse = await axios.get(variantUrl, {
-                timeout: 5000,
-                validateStatus: (status) => status === 200,
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-              });
-              
-              // Check if variant playlist is valid
-              if (typeof variantResponse.data === 'string' && 
-                  variantResponse.data.includes('#EXTINF')) {
-                return true;
-              }
-            } catch (e) {
-              // Variant fetch failed, but manifest was valid
-              return false;
-            }
-            break;
-          }
-        }
+    
+    let resolved = false;
+    
+    player.on('playing', () => {
+      if (!resolved) {
+        resolved = true;
+        window.testResult = { status: 'success', error: null };
+        console.log('STREAM_SUCCESS');
       }
-      
-      // Direct media playlist or successful validation
-      return true;
-    }
+    });
+    
+    player.on('error', (e) => {
+      if (!resolved) {
+        resolved = true;
+        const error = player.error();
+        window.testResult = { 
+          status: 'error', 
+          error: error ? error.message : 'Unknown error',
+          code: error ? error.code : null
+        };
+        console.log('STREAM_ERROR:', JSON.stringify(window.testResult));
+      }
+    });
+    
+    player.src({
+      src: '${url}',
+      type: 'application/x-mpegURL'
+    });
+  </script>
+</body>
+</html>`;
 
-    return false;
+    await page.setContent(html);
+    
+    // Wait for either success or error
+    const result = await Promise.race([
+      // Wait for playing event
+      page.waitForFunction(
+        () => window.testResult && window.testResult.status === 'success',
+        { timeout: STREAM_TIMEOUT }
+      ).then(() => ({ success: true })),
+      
+      // Wait for error
+      page.waitForFunction(
+        () => window.testResult && window.testResult.status === 'error',
+        { timeout: STREAM_TIMEOUT }
+      ).then(() => ({ success: false })),
+      
+      // Timeout
+      new Promise(resolve => 
+        setTimeout(() => resolve({ success: false }), STREAM_TIMEOUT)
+      )
+    ]);
+    
+    await page.close();
+    return result.success;
+    
   } catch (error) {
+    if (page) await page.close().catch(() => {});
     return false;
   }
 }
@@ -213,7 +260,6 @@ async function scanStreams() {
       workingStreams[stream.tvgId] = workingUrl;
     } else {
       failed++;
-      // Remove from working streams if it exists
       if (workingStreams[stream.tvgId]) {
         delete workingStreams[stream.tvgId];
         console.log(`  → Removed ${stream.tvgId} (no working stream found)`);
@@ -257,7 +303,6 @@ app.get('/', (req, res) => {
     });
   }
 
-  // Redirect to the actual stream
   res.redirect(302, streamUrl);
 });
 
@@ -279,25 +324,32 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Manual scan trigger (for testing)
+// Manual scan trigger
 app.get('/scan', async (req, res) => {
   res.json({ message: 'Scan started', check: '/list for results' });
-  scanStreams(); // Run in background
+  scanStreams();
+});
+
+// Cleanup on exit
+process.on('SIGINT', async () => {
+  console.log('\nShutting down...');
+  if (browser) {
+    await browser.close();
+  }
+  process.exit(0);
 });
 
 // Initialize and start
 async function start() {
+  await initBrowser();
   await initStreamsFile();
   
-  // Run initial scan
   console.log('Running initial scan...');
   await scanStreams();
   
-  // Schedule periodic scans
   setInterval(scanStreams, SCAN_INTERVAL);
   console.log(`Scheduled scans every ${SCAN_INTERVAL / 1000 / 60} minutes`);
   
-  // Start server
   app.listen(PORT, () => {
     console.log(`\nServer running on port ${PORT}`);
     console.log(`Stream endpoint: http://localhost:${PORT}/?id={tvg-id}`);
