@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: stream-monitor
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: stream-data
+      mountPath: /opt/render/project/src
+      sizeGB: 1
