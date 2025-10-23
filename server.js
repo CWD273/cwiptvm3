@@ -3,12 +3,13 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const M3U_URL = 'https://cwdiptvb.github.io/tv_channels.m3u';
 const SCAN_INTERVAL = 5 * 60 * 1000; // 5 minutes
-const STREAM_TIMEOUT = 8000; // 8 seconds per stream test
+const STREAM_TIMEOUT = 10000; // 10 seconds per stream test
 const STREAMS_FILE = path.join(__dirname, 'streams.json');
 
 // Store current working streams
@@ -68,20 +69,73 @@ async function parseM3U() {
   }
 }
 
-// Test a single stream URL
+// Test stream by attempting to fetch and parse the m3u8 manifest
 async function testStreamURL(url) {
   try {
+    // First, try to fetch the manifest
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), STREAM_TIMEOUT);
 
-    const response = await axios.head(url, {
+    const response = await axios.get(url, {
       signal: controller.signal,
       timeout: STREAM_TIMEOUT,
-      validateStatus: (status) => status === 200
+      validateStatus: (status) => status === 200,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
     });
 
     clearTimeout(timeoutId);
-    return response.status === 200;
+
+    // Check if response looks like a valid m3u8 file
+    const content = response.data;
+    if (typeof content === 'string' && 
+        (content.includes('#EXTM3U') || content.includes('#EXT-X-STREAM-INF') || content.includes('.ts'))) {
+      
+      // Additional validation: try to fetch the first segment URL if it's a master playlist
+      if (content.includes('#EXT-X-STREAM-INF')) {
+        // It's a master playlist, extract the first variant
+        const lines = content.split('\n');
+        for (let line of lines) {
+          line = line.trim();
+          if (line && !line.startsWith('#')) {
+            // Found a variant playlist URL
+            let variantUrl = line;
+            if (!variantUrl.startsWith('http')) {
+              // Relative URL, construct absolute
+              const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
+              variantUrl = baseUrl + variantUrl;
+            }
+            
+            // Try to fetch the variant playlist
+            try {
+              const variantResponse = await axios.get(variantUrl, {
+                timeout: 5000,
+                validateStatus: (status) => status === 200,
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+              });
+              
+              // Check if variant playlist is valid
+              if (typeof variantResponse.data === 'string' && 
+                  variantResponse.data.includes('#EXTINF')) {
+                return true;
+              }
+            } catch (e) {
+              // Variant fetch failed, but manifest was valid
+              return false;
+            }
+            break;
+          }
+        }
+      }
+      
+      // Direct media playlist or successful validation
+      return true;
+    }
+
+    return false;
   } catch (error) {
     return false;
   }
@@ -103,9 +157,10 @@ async function findWorkingStream(tvgId, name, originalUrl) {
   }
 
   // Try the original URL from M3U
+  console.log(`  Trying original: ${originalUrl}`);
   const works = await testStreamURL(originalUrl);
   if (works) {
-    console.log(`  ✓ Original URL works: ${originalUrl}`);
+    console.log(`  ✓ Original URL works`);
     return originalUrl;
   }
 
@@ -143,6 +198,7 @@ async function scanStreams() {
 
   let updated = 0;
   let failed = 0;
+  let unchanged = 0;
 
   for (const stream of streams) {
     const workingUrl = await findWorkingStream(stream.tvgId, stream.name, stream.url);
@@ -151,6 +207,8 @@ async function scanStreams() {
       if (workingStreams[stream.tvgId] !== workingUrl) {
         console.log(`  → Updated ${stream.tvgId}: ${workingUrl}`);
         updated++;
+      } else {
+        unchanged++;
       }
       workingStreams[stream.tvgId] = workingUrl;
     } else {
@@ -171,6 +229,7 @@ async function scanStreams() {
   console.log(`\n=== Scan complete ===`);
   console.log(`Working: ${Object.keys(workingStreams).length}`);
   console.log(`Updated: ${updated}`);
+  console.log(`Unchanged: ${unchanged}`);
   console.log(`Failed: ${failed}`);
   console.log('========================\n');
 }
