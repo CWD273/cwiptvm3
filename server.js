@@ -117,9 +117,7 @@ async function findWorkingStream(tvgId, name, originalUrl) {
   for (let i = 1; i <= 99; i++) {
     const testUrl = baseUrl.replace('fl{N}', `fl${i}`);
     
-    if (i % 10 === 0) {
-      console.log(`  Testing fl${i}...`);
-    }
+    console.log(`  Testing fl${i}...`);
     
     const works = await testStreamURL(testUrl);
     if (works) {
